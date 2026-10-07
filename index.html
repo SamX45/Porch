@@ -338,12 +338,20 @@ async function loadMembers(id){
   presence[id] = new Set(data.map(row => row.user_id));
   data.forEach(row => { if (row.profiles) cacheProfile(row.profiles); });
 }
-function resubscribe(){
-  if (msgChannel){ sb.removeChannel(msgChannel); msgChannel = null; }
+let channelGen = 0; // every resubscribe() call gets its own number; only the newest one's events are ever acted on
+async function resubscribe(){
+  const myGen = ++channelGen;
+  const old = msgChannel; msgChannel = null;
+  if (old) await sb.removeChannel(old); // wait for the old connection to actually close
+  if (myGen !== channelGen) return;     // a newer resubscribe() started while we were waiting — let that one win
   const ids = [...joined];
   if (!ids.length) return;
-  msgChannel = sb.channel("porch-messages")
+  const stillCurrent = () => myGen === channelGen; // belt-and-suspenders: even if the old channel's
+                                                     // close is slow or never confirms, a stale channel's
+                                                     // own callbacks refuse to act once superseded
+  const ch = sb.channel("porch-messages-" + myGen)
     .on("postgres_changes", {event:"INSERT", schema:"public", table:"messages", filter:`room_id=in.(${ids.join(",")})`}, async payload => {
+      if (!stillCurrent()) return;
       const row = payload.new;
       const arr = msgs[row.room_id] || (msgs[row.room_id] = []);
       if (arr.some(x => x.id === row.id)) return; // the REST response for our own send already placed this exact row
@@ -354,14 +362,16 @@ function resubscribe(){
       if (pendingIdx > -1){ mapped.clientId = arr[pendingIdx].id; arr[pendingIdx] = mapped; }
       else arr.push(mapped);
       await ensureProfile(row.sender_id);
-      chat.emit({type:"message", msg:mapped});
+      if (stillCurrent()) chat.emit({type:"message", msg:mapped});
     })
     .on("postgres_changes", {event:"DELETE", schema:"public", table:"messages", filter:`room_id=in.(${ids.join(",")})`}, payload => {
+      if (!stillCurrent()) return;
       const row = payload.old, a = msgs[row.room_id];
       if (a){ const i = a.findIndex(x => x.id === row.id); if (i > -1) a.splice(i, 1); }
       chat.emit({type:"remove", roomId:row.room_id});
     })
     .subscribe();
+  if (myGen === channelGen) msgChannel = ch; else sb.removeChannel(ch);
 }
 
 /* ============ data layer: every method here is a real call to Supabase ============ */
@@ -572,7 +582,7 @@ function renderChat(newId){
 /* ============ events ============ */
 chat.subscribe(e => {
   if (e.type === "message"){
-    const a = msgs[e.msg.roomId]; a.push(e.msg); if (a.length > 200) a.shift();
+    const a = msgs[e.msg.roomId] || (msgs[e.msg.roomId] = []); if (a.length > 200) a.shift();
     if (e.msg.roomId === roomId){
       const stick = nearBottom(), mineMsg = me && e.msg.uid === me.id;
       renderChat(e.msg.id);
@@ -704,10 +714,12 @@ function profileSheet(first){
   };
   const form = h("form", {onsubmit: async ev => {
     ev.preventDefault(); const name = d.name.trim(); if (!name) return;
-    const u = {id: me.id, name, bio: d.bio.trim(), shape:d.shape, color:d.color, dp:d.dp};
     save.disabled = true;
-    try{ await chat.saveProfile(u); closeSheet(); if (first) await enterRoom(); }
-    catch{ save.disabled = false; err.textContent = "Couldn't save your profile. Check your connection and try again."; }
+    try{
+      if (!me) await createAccountAndJoin(); // first real action — this is when the account is actually created
+      const u = {id: me.id, name, bio: d.bio.trim(), shape:d.shape, color:d.color, dp:d.dp};
+      await chat.saveProfile(u); closeSheet(); if (first) await enterRoom();
+    }catch{ save.disabled = false; err.textContent = "Couldn't save your profile. Check your connection and try again."; }
   }},
     first ? logo(60) : null,
     h("h2", {}, first ? "Join Porch" : "Your profile"),
@@ -834,54 +846,64 @@ function fatalError(msg, retry){
   list.replaceChildren(h("div", {class:"empty"}, mark("circle", "#D6402F", 40), h("h2", {}, "Couldn't connect"),
     h("p", {}, msg), h("button", {class:"go", type:"button", style:"max-width:220px", onclick:retry}, "Retry")));
 }
+// Runs once we have a real signed-in user — either a returning visitor's
+// restored session, or someone who just finished the join form for the
+// first time. Loads everything their account can see.
+async function loadSignedInUser(authId, isFirstTime){
+  let prof = (await sb.from("profiles").select("*").eq("id", authId).maybeSingle()).data;
+  if (!prof){ await sleep(500); prof = (await sb.from("profiles").select("*").eq("id", authId).maybeSingle()).data; }
+  if (!prof) throw new Error("profile not ready");
+  me = mapProfile(prof); users.set(me.id, me);
+
+  const {data:roomRows} = await sb.from("rooms").select("*").order("created_at", {ascending:true});
+  rooms = (roomRows || []).map(mapRoom);
+  defaultRoomId = (rooms.find(r => r.fixed) || rooms[0] || {}).id || null;
+  rooms.forEach(r => { msgs[r.id] = msgs[r.id] || []; });
+
+  const {data:memberRows} = await sb.from("room_members").select("room_id").eq("user_id", me.id);
+  joined = new Set((memberRows || []).map(r => r.room_id));
+
+  await Promise.all(rooms.map(r => loadMembers(r.id)));
+
+  const {data:followRows} = await sb.from("follows").select("followee_id").eq("follower_id", me.id);
+  follows = new Set((followRows || []).map(r => r.followee_id));
+  const missing = [...follows].filter(id => !users.has(id));
+  if (missing.length){ const {data:fp} = await sb.from("profiles").select("*").in("id", missing); (fp || []).forEach(cacheProfile); }
+
+  ready = true;
+  resubscribe();
+  return isFirstTime || prof.name === "New user";
+}
 async function init(){
   list.replaceChildren(h("div", {class:"empty"}, logo(40), h("h2", {}, "Loading…")));
   side.replaceChildren(h("div", {class:"s-head"}, logo(54)));
   try{
     const {data:{session:existing}} = await sb.auth.getSession();
-    let session = existing;
-    if (!session){
-      const {data, error} = await sb.auth.signInAnonymously();
-      if (error) throw error;
-      session = data.session;
-    }
-    const authId = session.user.id;
-
-    let prof = (await sb.from("profiles").select("*").eq("id", authId).maybeSingle()).data;
-    if (!prof){ await sleep(500); prof = (await sb.from("profiles").select("*").eq("id", authId).maybeSingle()).data; }
-    if (!prof) throw new Error("profile not ready");
-    me = mapProfile(prof); users.set(me.id, me);
-
-    const {data:roomRows} = await sb.from("rooms").select("*").order("created_at", {ascending:true});
-    rooms = (roomRows || []).map(mapRoom);
-    defaultRoomId = (rooms.find(r => r.fixed) || rooms[0] || {}).id || null;
-    rooms.forEach(r => { msgs[r.id] = msgs[r.id] || []; });
-
-    const {data:memberRows} = await sb.from("room_members").select("room_id").eq("user_id", me.id);
-    joined = new Set((memberRows || []).map(r => r.room_id));
-
-    await Promise.all(rooms.map(r => loadMembers(r.id)));
-
-    const {data:followRows} = await sb.from("follows").select("followee_id").eq("follower_id", me.id);
-    follows = new Set((followRows || []).map(r => r.followee_id));
-    const missing = [...follows].filter(id => !users.has(id));
-    if (missing.length){ const {data:fp} = await sb.from("profiles").select("*").in("id", missing); (fp || []).forEach(cacheProfile); }
-
-    ready = true;
-    resubscribe();
-
-    if (prof.name === "New user"){
-      renderSide();
+    if (!existing){
+      // Nobody's account exists yet. Show the join sheet WITHOUT creating
+      // one — an account is only created once they actually submit it, in
+      // createAccountAndJoin() below. Just looking at the page should never
+      // leave a row in the database.
+      side.replaceChildren(h("div", {class:"s-head"}, logo(54)));
       profileSheet(true);
-    } else {
-      roomId = joined.has(defaultRoomId) ? defaultRoomId : [...joined][0] || null;
-      if (!roomId && defaultRoomId){ await chat.joinRoom(defaultRoomId); roomId = defaultRoomId; }
-      if (roomId) await loadMessages(roomId);
-      renderSide(); renderHeader(); renderChat(); toBottom(false); syncSend();
+      return;
     }
+    const needsProfile = await loadSignedInUser(existing.user.id, false);
+    if (needsProfile){ renderSide(); profileSheet(true); return; }
+    roomId = joined.has(defaultRoomId) ? defaultRoomId : [...joined][0] || null;
+    if (!roomId && defaultRoomId){ await chat.joinRoom(defaultRoomId); roomId = defaultRoomId; }
+    if (roomId) await loadMessages(roomId);
+    renderSide(); renderHeader(); renderChat(); toBottom(false); syncSend();
   }catch(err){
     fatalError("Check your connection and try again.", init);
   }
+}
+// Called from the join form the very first time someone submits it. This is
+// the one moment a new account is allowed to be created.
+async function createAccountAndJoin(){
+  const {data, error} = await sb.auth.signInAnonymously();
+  if (error) throw error;
+  await loadSignedInUser(data.session.user.id, true);
 }
 init();
 </script>
