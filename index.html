@@ -88,6 +88,9 @@ header{display:flex;align-items:center;gap:10px;padding:calc(10px + env(safe-are
 /* messages */
 #list{flex:1;overflow-y:auto;padding:10px 14px 8px;display:flex;flex-direction:column;gap:2px;overscroll-behavior:contain;scroll-behavior:smooth}
 .day{align-self:center;margin:10px 0 12px;font-size:12.5px;font-weight:600;color:var(--muted);background:var(--wash);padding:3px 12px;border-radius:99px}
+.pin{align-self:stretch;background:var(--wash);border:1px solid var(--line);border-radius:14px;padding:10px 14px;margin:4px 0 14px}
+.pin-h{font:700 12.5px var(--display);letter-spacing:.02em;color:var(--muted);margin-bottom:3px}
+.pin-t{font-size:14px;line-height:1.4;white-space:pre-wrap}
 .sys{align-self:center;margin:8px 0;font-size:13px;color:var(--muted)}
 .row{display:flex;gap:8px;align-items:flex-end;max-width:88%}
 .row.other{align-self:flex-start}
@@ -307,6 +310,7 @@ let follows = new Set();
 const users = new Map();
 const msgs = {};
 const presence = {};       // roomId -> Set of member ids. Membership, not live "currently online" — see note below.
+const roles = {};          // roomId -> Map of member id -> 'member' | 'admin'
 const unread = {};
 let roomId = null, defaultRoomId = null, filter = "all", selectedId = null, unseen = 0, sentTimes = [], cooldownTimer = null, ready = false, msgChannel = null;
 const room = id => rooms.find(r => r.id === id);
@@ -315,7 +319,7 @@ const coarse = matchMedia("(pointer:coarse)").matches;
 const wide = matchMedia("(min-width:900px)");
 
 /* ---- turn a database row into the shape the UI already expects ---- */
-function mapRoom(r){ return {id:r.id, name:r.name, desc:r.description, shape:r.shape, color:r.color, vis:r.visibility, code:r.invite_code, owner:r.owner_id, fixed: r.owner_id === null}; }
+function mapRoom(r){ return {id:r.id, name:r.name, desc:r.description, shape:r.shape, color:r.color, vis:r.visibility, code:r.invite_code, owner:r.owner_id, fixed: r.owner_id === null, rules:r.rules || ""}; }
 function mapProfile(p){ return {id:p.id, name:p.name, bio:p.bio, shape:p.shape, color:p.color, dp:p.avatar_url || null}; }
 function mapMessage(m){ return {id:m.id, roomId:m.room_id, uid:m.sender_id, text:m.text, ts:new Date(m.created_at).getTime(), status:"sent"}; }
 function cacheProfile(p){ users.set(p.id, mapProfile(p)); }
@@ -333,11 +337,20 @@ async function loadMessages(id){
   msgs[id] = data.map(mapMessage);
 }
 async function loadMembers(id){
-  const {data, error} = await sb.from("room_members").select("user_id, profiles(*)").eq("room_id", id);
-  if (error){ presence[id] = presence[id] || new Set(); return; }
+  const {data, error} = await sb.from("room_members").select("user_id, role, profiles(*)").eq("room_id", id);
+  if (error){ presence[id] = presence[id] || new Set(); roles[id] = roles[id] || new Map(); return; }
   presence[id] = new Set(data.map(row => row.user_id));
+  roles[id] = new Map(data.map(row => [row.user_id, row.role]));
   data.forEach(row => { if (row.profiles) cacheProfile(row.profiles); });
 }
+function myRoleIn(id){
+  const rm = room(id);
+  if (!rm || !me) return null;
+  if (rm.owner === me.id) return "owner";
+  const m = roles[id]; if (!m) return null;
+  return m.get(me.id) || "member";
+}
+function canModerate(id){ const r = myRoleIn(id); return r === "owner" || r === "admin"; }
 let channelGen = 0; // every resubscribe() call gets its own number; only the newest one's events are ever acted on
 async function resubscribe(){
   const myGen = ++channelGen;
@@ -423,7 +436,7 @@ const chat = {
   async createRoom(r){
     const {data, error} = await sb.from("rooms").insert({
       name:r.name, description:r.desc, shape:r.shape, color:r.color, visibility:r.vis,
-      invite_code: r.vis === "private" ? r.code : null, owner_id: me.id
+      invite_code: r.vis === "private" ? r.code : null, owner_id: me.id, rules: r.rules || ""
     }).select().single();
     if (error) throw error;
     const mapped = mapRoom(data);
@@ -433,6 +446,18 @@ const chat = {
     await loadMembers(mapped.id);
     resubscribe(); this.emit({type:"rooms"});
     return mapped;
+  },
+  async setRole(roomId, userId, role){
+    const {error} = await sb.from("room_members").update({role}).eq("room_id", roomId).eq("user_id", userId);
+    if (error) throw error;
+    await loadMembers(roomId);
+    this.emit({type:"rooms"});
+  },
+  async kickMember(roomId, userId){
+    const {error} = await sb.from("room_members").delete().eq("room_id", roomId).eq("user_id", userId);
+    if (error) throw error;
+    await loadMembers(roomId);
+    this.emit({type:"rooms"});
   },
   async joinRoom(id){
     const {error} = await sb.from("room_members").insert({room_id:id, user_id:me.id});
@@ -531,6 +556,8 @@ $("#jump").addEventListener("click", () => toBottom());
 function renderChat(newId){
   if (!roomId || !cur()) return;
   list.replaceChildren();
+  const room0 = cur();
+  if (filter === "all" && room0.rules) list.append(h("div", {class:"pin"}, h("div", {class:"pin-h"}, "📌 Welcome Mat"), h("div", {class:"pin-t"}, room0.rules)));
   let arr = msgs[roomId] || [];
   if (filter === "following") arr = arr.filter(m => !m.system && (m.uid === (me && me.id) || follows.has(m.uid)));
   if (!arr.length){
@@ -560,9 +587,10 @@ function renderChat(newId){
       mine ? h("b", {style:"font:700 13.5px var(--display);color:var(--ink)"}, "You") : h("button", {class:"namebtn", type:"button", onclick: () => userSheet(u)}, u.name),
       !mine && follows.has(u.id) ? h("span", {class:"fol"}, "Following") : null,
       h("span", {}, fmtTime(m.ts))));
+    const canRemoveThis = mine || canModerate(roomId);
     const b = h("div", {class:"bubble" + (m.status === "sending" ? " pending" : "") + (m.status === "failed" ? " failed" : "")}, m.text);
-    if (mine && m.status !== "failed"){
-      b.tabIndex = 0; b.setAttribute("role", "button"); b.setAttribute("aria-label", "Your message. Press for options.");
+    if (canRemoveThis && m.status !== "failed"){
+      b.tabIndex = 0; b.setAttribute("role", "button"); b.setAttribute("aria-label", "Press for options.");
       const tg = () => { selectedId = selectedId === m.id ? null : m.id; renderChat(); };
       b.addEventListener("click", tg);
       b.addEventListener("keydown", ev => { if (ev.key === "Enter" || ev.key === " "){ ev.preventDefault(); tg(); } });
@@ -572,8 +600,8 @@ function renderChat(newId){
       col.append(h("div", {class:"status err"}, "Not sent.",
         h("button", {class:"link", type:"button", onclick: () => retrySend(m)}, "Retry"),
         h("button", {class:"link del", type:"button", onclick: () => { const a = msgs[m.roomId]; a.splice(a.indexOf(m), 1); renderChat(); }}, "Discard")));
-    } else if (mine && selectedId === m.id){
-      col.append(h("div", {class:"status"}, h("button", {class:"link del", type:"button", onclick: () => { selectedId = null; chat.remove(m); }}, "Delete message")));
+    } else if (canRemoveThis && selectedId === m.id){
+      col.append(h("div", {class:"status"}, h("button", {class:"link del", type:"button", onclick: () => { selectedId = null; chat.remove(m); }}, mine ? "Delete message" : "Remove message")));
     }
     row.append(col); list.append(row); prev = m;
   });
@@ -712,6 +740,12 @@ function profileSheet(first){
     catch{ err.textContent = "That file could not be read as an image. Try a JPG or PNG."; }
     file.value = "";
   };
+  const googleErr = h("p", {class:"err", role:"alert"});
+  const googleBtn = h("button", {class:"pill", type:"button", style:"width:100%;justify-content:center;margin-bottom:14px", onclick: async () => {
+    googleErr.textContent = "";
+    try{ first ? await signInWithGoogle() : await connectGoogle(); }
+    catch{ googleErr.textContent = "Couldn't reach Google. Check your connection and try again."; }
+  }}, first ? "Continue with Google" : "Connect Google account");
   const form = h("form", {onsubmit: async ev => {
     ev.preventDefault(); const name = d.name.trim(); if (!name) return;
     save.disabled = true;
@@ -724,6 +758,8 @@ function profileSheet(first){
     first ? logo(60) : null,
     h("h2", {}, first ? "Join Porch" : "Your profile"),
     h("p", {class:"sub"}, first ? "No account needed. Add a photo or pick a mark so people recognise you." : "This is how you appear in every room."),
+    first ? [googleBtn, googleErr, h("p", {class:"note", style:"text-align:center;margin:-6px 0 16px"}, "or continue as a guest")]
+      : (myIsAnonymous ? [googleBtn, googleErr, h("p", {class:"note"}, "Connecting Google keeps this exact profile, your rooms and your messages — it just adds a permanent way back in.")] : h("p", {class:"note"}, "Signed in with Google.")),
     pv,
     h("div", {class:"row2"}, upBtn, rmBtn, file), err,
     h("label", {class:"f", for:"pf-name"}, "Name"), nameIn,
@@ -769,6 +805,7 @@ function createRoomSheet(){
   const pv = h("div", {class:"pv"});
   const nameIn = h("input", {class:"in", id:"rm-name", maxlength:"30", placeholder:"e.g. Weekend Builders"});
   const descIn = h("input", {class:"in", id:"rm-desc", maxlength:"80", placeholder:"What is this room for? (optional)"});
+  const rulesIn = h("textarea", {class:"in", id:"rm-rules", maxlength:"300", rows:"3", placeholder:"Be kind. No spam. Stay on topic.", style:"resize:vertical;font-family:inherit"});
   const go = h("button", {class:"go", type:"submit", disabled:true}, "Create room");
   const draw = () => { pv.replaceChildren(mark(d.shape, d.color, 56), h("strong", {}, nameIn.value.trim() || "Room name")); go.disabled = !nameIn.value.trim(); };
   const pk = shapePicker(d, draw);
@@ -778,7 +815,7 @@ function createRoomSheet(){
   openSheet(h("form", {onsubmit: async ev => {
     ev.preventDefault(); const name = nameIn.value.trim(); if (!name) return;
     const CH = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    const r = {name, desc:descIn.value.trim() || "A room by " + me.name + ".", shape:d.shape, color:d.color, vis:d.vis};
+    const r = {name, desc:descIn.value.trim() || "A room by " + me.name + ".", shape:d.shape, color:d.color, vis:d.vis, rules:rulesIn.value.trim()};
     if (d.vis === "private") r.code = Array.from({length:6}, () => CH[Math.floor(Math.random() * CH.length)]).join("");
     go.disabled = true;
     try{ const made = await chat.createRoom(r); closeSheet(); switchRoom(made.id); }
@@ -791,6 +828,8 @@ function createRoomSheet(){
     h("div", {class:"lg"}, "Who can join"),
     radio("public", "Public", "Listed under Discover. Anyone can join."),
     radio("private", "Private", "Hidden. People need the invite code."),
+    h("label", {class:"f", for:"rm-rules"}, "Welcome Mat"), rulesIn,
+    h("p", {class:"note"}, "Pinned at the top of this room's chat — the first thing people read before stepping in. Optional."),
     err, go));
   draw(); nameIn.focus();
 }
@@ -812,8 +851,11 @@ function codeSheet(){
 
 /* --- room details --- */
 $("#roomBtn").onclick = roomSheet; $("#people").onclick = roomSheet;
-function roomSheet(){
-  const r = cur(), owner = me && r.owner === me.id;
+async function roomSheet(){
+  const r = cur();
+  await loadMembers(r.id); // the member list can change from someone else's session — never trust a stale cache here
+  const owner = me && r.owner === me.id, mod = canModerate(r.id);
+  const roleMap = roles[r.id] || new Map();
   const members = [...presence[r.id]].map(id => users.get(id)).filter(Boolean);
   const copyBtn = h("button", {class:"pill", type:"button", onclick: async () => { try{ await navigator.clipboard.writeText(r.code); copyBtn.textContent = "Copied"; }catch{ copyBtn.textContent = "Copy failed"; } }}, "Copy");
   const actions = h("div", {});
@@ -824,15 +866,32 @@ function roomSheet(){
       h("button", {class:"go ghost", type:"button", style:"color:var(--ink)", onclick: roomSheet}, "Cancel"));
   };
   if (!r.fixed) actions.append(danger);
+
+  const memberRow = u => {
+    const isOwner = u.id === r.owner, isMe = me && u.id === me.id;
+    const role = isOwner ? "owner" : (roleMap.get(u.id) || "member");
+    const roleTag = role === "owner" ? h("span", {class:"tag"}, "Owner") : role === "admin" ? h("span", {class:"tag"}, "Admin") : null;
+    const modBtns = [];
+    if (owner && !isOwner){ // only the owner promotes/demotes — keeps it simple and safe
+      modBtns.push(h("button", {class:"link", type:"button", onclick: async () => { try{ await chat.setRole(r.id, u.id, role === "admin" ? "member" : "admin"); roomSheet(); }catch{} }}, role === "admin" ? "Remove admin" : "Make admin"));
+    }
+    if (mod && !isOwner && !isMe){ // owner or an existing admin can remove a disruptive member
+      modBtns.push(h("button", {class:"link del", type:"button", onclick: async () => { try{ await chat.kickMember(r.id, u.id); roomSheet(); }catch{} }}, "Remove"));
+    }
+    return h("div", {class:"mrow"},
+      h("button", {class:"plain", type:"button", onclick: () => userSheet(u), "aria-label":"View " + u.name}, avatar(u, 40)),
+      h("div", {class:"tx"}, h("div", {class:"nm"}, (isMe ? u.name + " (you)" : u.name), roleTag), h("div", {class:"sb"}, u.bio || "")),
+      isMe ? null : followBtn(u, true),
+      modBtns.length ? h("div", {style:"display:flex;flex-direction:column;align-items:flex-end"}, modBtns) : null);
+  };
+
   openSheet(h("div", {},
     h("div", {class:"pv"}, mark(r.shape, r.color, 56), h("div", {}, h("strong", {}, r.name), h("div", {style:"color:var(--muted);font-size:14px"}, r.vis === "private" ? "Private room" : "Public room"))),
     h("p", {}, r.desc),
+    r.rules ? [h("div", {class:"lg"}, "Welcome Mat"), h("p", {}, r.rules)] : null,
     r.vis === "private" && r.code ? [h("div", {class:"lg"}, "Invite code"), h("div", {class:"code"}, h("b", {}, r.code), copyBtn), h("p", {class:"note"}, "Anyone with this code can join. Share it only with people you trust.")] : null,
     h("div", {class:"lg"}, `Members (${members.length})`),
-    members.map(u => h("div", {class:"mrow"},
-      h("button", {class:"plain", type:"button", onclick: () => userSheet(u), "aria-label":"View " + u.name}, avatar(u, 40)),
-      h("div", {class:"tx"}, h("div", {class:"nm"}, me && u.id === me.id ? u.name + " (you)" : u.name), h("div", {class:"sb"}, u.bio || "")),
-      me && u.id === me.id ? null : followBtn(u, true))),
+    members.map(memberRow),
     actions));
 }
 
@@ -846,10 +905,13 @@ function fatalError(msg, retry){
   list.replaceChildren(h("div", {class:"empty"}, mark("circle", "#D6402F", 40), h("h2", {}, "Couldn't connect"),
     h("p", {}, msg), h("button", {class:"go", type:"button", style:"max-width:220px", onclick:retry}, "Retry")));
 }
+let myIsAnonymous = true; // false once the account is linked to a real Google identity
 // Runs once we have a real signed-in user — either a returning visitor's
 // restored session, or someone who just finished the join form for the
 // first time. Loads everything their account can see.
-async function loadSignedInUser(authId, isFirstTime){
+async function loadSignedInUser(authUser, isFirstTime){
+  const authId = authUser.id;
+  myIsAnonymous = authUser.is_anonymous !== false; // supabase-js sets this explicitly; treat unknown as anonymous
   let prof = (await sb.from("profiles").select("*").eq("id", authId).maybeSingle()).data;
   if (!prof){ await sleep(500); prof = (await sb.from("profiles").select("*").eq("id", authId).maybeSingle()).data; }
   if (!prof) throw new Error("profile not ready");
@@ -888,7 +950,11 @@ async function init(){
       profileSheet(true);
       return;
     }
-    const needsProfile = await loadSignedInUser(existing.user.id, false);
+    // if they just came back from a Google sign-in, this IS their first real
+    // session even though one "exists" now — the trigger only just created
+    // their profile, so prof.name will still read "New user" and the usual
+    // needsProfile check below sends them to the join sheet to pick a name.
+    const needsProfile = await loadSignedInUser(existing.user, false);
     if (needsProfile){ renderSide(); profileSheet(true); return; }
     roomId = joined.has(defaultRoomId) ? defaultRoomId : [...joined][0] || null;
     if (!roomId && defaultRoomId){ await chat.joinRoom(defaultRoomId); roomId = defaultRoomId; }
@@ -899,11 +965,24 @@ async function init(){
   }
 }
 // Called from the join form the very first time someone submits it. This is
-// the one moment a new account is allowed to be created.
+// the one moment a new ANONYMOUS account is allowed to be created.
 async function createAccountAndJoin(){
   const {data, error} = await sb.auth.signInAnonymously();
   if (error) throw error;
-  await loadSignedInUser(data.session.user.id, true);
+  await loadSignedInUser(data.session.user, true);
+}
+// Continuing with Google when there's no session yet (or the person chose
+// Google instead of "Continue as guest"). This navigates away to Google and
+// back — nothing after this call runs until the page reloads.
+async function signInWithGoogle(){
+  const {error} = await sb.auth.signInWithOAuth({provider:"google", options:{redirectTo: location.href}});
+  if (error) throw error;
+}
+// Upgrading an EXISTING anonymous account to a real Google identity, keeping
+// the same profile, rooms and messages — nothing is lost or recreated.
+async function connectGoogle(){
+  const {error} = await sb.auth.linkIdentity({provider:"google", options:{redirectTo: location.href}});
+  if (error) throw error;
 }
 init();
 </script>
