@@ -744,7 +744,7 @@ function profileSheet(first){
   const googleBtn = h("button", {class:"pill", type:"button", style:"width:100%;justify-content:center;margin-bottom:14px", onclick: async () => {
     googleErr.textContent = "";
     try{ first ? await signInWithGoogle() : await connectGoogle(); }
-    catch{ googleErr.textContent = "Couldn't reach Google. Check your connection and try again."; }
+    catch(e){ googleErr.textContent = (e && e.message) ? e.message : "Couldn't reach Google. Check your connection and try again."; }
   }}, first ? "Continue with Google" : "Connect Google account");
   const form = h("form", {onsubmit: async ev => {
     ev.preventDefault(); const name = d.name.trim(); if (!name) return;
@@ -767,8 +767,24 @@ function profileSheet(first){
     h("div", {class:"lg"}, "Mark shape"), pk.sRow,
     h("div", {class:"lg"}, "Colour"), pk.cRow,
     h("p", {class:"note"}, "Your mark shows when you have no photo. Your colour rings your photo."),
-    save);
+    save,
+    first ? null : signOutSection());
   draw(); openSheet(form, first); nameIn.focus();
+}
+function signOutSection(){
+  const box = h("div", {});
+  const ask = () => {
+    box.replaceChildren(
+      myIsAnonymous
+        ? h("p", {class:"note", style:"color:var(--danger)"}, "You haven't connected Google. Signing out means this account — your name, rooms and messages — is gone for good on this device. There's no way back in without a Google link.")
+        : h("p", {class:"note"}, "You can sign back in with Google anytime."),
+      h("button", {class:"go", type:"button", style:"background:var(--danger)", onclick: async () => { box.firstChild && (box.firstChild.textContent = "Signing out…"); await sb.auth.signOut(); location.reload(); }}, myIsAnonymous ? "Sign out anyway" : "Sign out"),
+      h("button", {class:"go ghost", type:"button", style:"color:var(--ink)", onclick: () => box.replaceChildren(trigger)}, "Cancel")
+    );
+  };
+  const trigger = h("button", {class:"go ghost", type:"button", style:"color:var(--danger);border-color:var(--danger)", onclick: ask}, "Sign out");
+  box.append(trigger);
+  return box;
 }
 
 /* --- someone else's profile --- */
@@ -911,7 +927,15 @@ let myIsAnonymous = true; // false once the account is linked to a real Google i
 // first time. Loads everything their account can see.
 async function loadSignedInUser(authUser, isFirstTime){
   const authId = authUser.id;
-  myIsAnonymous = authUser.is_anonymous !== false; // supabase-js sets this explicitly; treat unknown as anonymous
+  // The cached session token can still claim "anonymous" for a while right after
+  // linking a Google identity, even though the database already updated — so ask
+  // the server directly rather than trusting the locally-stored claim.
+  try{
+    const {data:{user:freshUser}} = await sb.auth.getUser();
+    myIsAnonymous = (freshUser || authUser).is_anonymous !== false;
+  }catch{
+    myIsAnonymous = authUser.is_anonymous !== false;
+  }
   let prof = (await sb.from("profiles").select("*").eq("id", authId).maybeSingle()).data;
   if (!prof){ await sleep(500); prof = (await sb.from("profiles").select("*").eq("id", authId).maybeSingle()).data; }
   if (!prof) throw new Error("profile not ready");
