@@ -307,6 +307,7 @@ let me = null;
 let rooms = [];
 let joined = new Set();
 let follows = new Set();
+let blocked = new Set(); // people whose messages I've chosen to hide from myself
 const users = new Map();
 const msgs = {};
 const presence = {};       // roomId -> Set of member ids. Membership, not live "currently online" — see note below.
@@ -351,6 +352,29 @@ function myRoleIn(id){
   return m.get(me.id) || "member";
 }
 function canModerate(id){ const r = myRoleIn(id); return r === "owner" || r === "admin"; }
+function dmPartner(roomId){
+  const ids = [...(presence[roomId] || [])].filter(id => !me || id !== me.id);
+  return ids.length ? users.get(ids[0]) : null;
+}
+let membershipChannel = null; // separate from the per-room message channel below — this one never changes shape, it just watches for "you've been added to a room" (including a new DM) for the whole session
+function subscribeToMyMemberships(){
+  if (membershipChannel || !me) return;
+  membershipChannel = sb.channel("porch-my-memberships")
+    .on("postgres_changes", {event:"INSERT", schema:"public", table:"room_members", filter:`user_id=eq.${me.id}`}, async payload => {
+      const newRoomId = payload.new.room_id;
+      if (joined.has(newRoomId)) return; // we already know — most likely we caused this ourselves
+      const {data} = await sb.from("rooms").select("*").eq("id", newRoomId).maybeSingle();
+      if (!data) return;
+      const mapped = mapRoom(data);
+      if (!room(mapped.id)) rooms.push(mapped);
+      msgs[mapped.id] = msgs[mapped.id] || [];
+      joined.add(mapped.id);
+      await loadMembers(mapped.id);
+      resubscribe(); // rebuild the message channel so it now covers this room too
+      chat.emit({type:"rooms"});
+    })
+    .subscribe();
+}
 let channelGen = 0; // every resubscribe() call gets its own number; only the newest one's events are ever acted on
 async function resubscribe(){
   const myGen = ++channelGen;
@@ -453,6 +477,23 @@ const chat = {
     await loadMembers(roomId);
     this.emit({type:"rooms"});
   },
+  async block(userId, on){
+    if (on){
+      const {error} = await sb.from("blocks").insert({blocker_id:me.id, blocked_id:userId});
+      if (error && error.code !== "23505") throw error;
+      blocked.add(userId);
+      if (follows.has(userId)){ try{ await this.follow(userId, false); }catch{} } // blocking someone you followed implies unfollowing them
+    } else {
+      const {error} = await sb.from("blocks").delete().eq("blocker_id", me.id).eq("blocked_id", userId);
+      if (error) throw error;
+      blocked.delete(userId);
+    }
+    this.emit({type:"social"});
+  },
+  async reportMessage(messageId, reason){
+    const {error} = await sb.rpc("report_message", {target_message_id: messageId, reason});
+    if (error) throw error;
+  },
   async kickMember(roomId, userId){
     const {error} = await sb.from("room_members").delete().eq("room_id", roomId).eq("user_id", userId);
     if (error) throw error;
@@ -476,6 +517,16 @@ const chat = {
     resubscribe(); this.emit({type:"rooms"});
     return mapped;
   },
+  async getOrCreateDm(otherUserId){
+    const {data, error} = await sb.rpc("get_or_create_dm", {other_user_id: otherUserId});
+    if (error) throw new Error(error.message || "Couldn't open that conversation.");
+    const mapped = mapRoom(data);
+    if (!room(mapped.id)) rooms.push(mapped);
+    msgs[mapped.id] = msgs[mapped.id] || []; joined.add(mapped.id);
+    await loadMembers(mapped.id);
+    resubscribe(); this.emit({type:"rooms"});
+    return mapped;
+  },
   async leaveRoom(id){
     const {error} = await sb.from("room_members").delete().eq("room_id", id).eq("user_id", me.id);
     if (error) throw error;
@@ -492,10 +543,12 @@ const chat = {
 /* ============ sidebar ============ */
 const side = $("#side");
 function lastMsg(id){ const a = msgs[id] || []; for (let i = a.length - 1; i >= 0; i--) if (!a[i].system) return a[i]; return null; }
-function onlineRooms(userId){ return rooms.filter(r => presence[r.id] && presence[r.id].has(userId)); }
+function onlineRooms(userId){ return rooms.filter(r => r.vis !== "dm" && presence[r.id] && presence[r.id].has(userId)); }
 
 function renderSide(){
-  const mine = rooms.filter(r => joined.has(r.id)).sort((a, b) => (b.fixed ? 1 : 0) - (a.fixed ? 1 : 0) || ((lastMsg(b.id) || {ts:0}).ts - (lastMsg(a.id) || {ts:0}).ts));
+  const allMine = rooms.filter(r => joined.has(r.id)).sort((a, b) => (b.fixed ? 1 : 0) - (a.fixed ? 1 : 0) || ((lastMsg(b.id) || {ts:0}).ts - (lastMsg(a.id) || {ts:0}).ts));
+  const mine = allMine.filter(r => r.vis !== "dm");
+  const dms = allMine.filter(r => r.vis === "dm");
   const discover = rooms.filter(r => r.vis === "public" && !joined.has(r.id));
   const following = [...follows].map(id => users.get(id)).filter(Boolean);
 
@@ -505,6 +558,16 @@ function renderSide(){
     return h("button", {class:"item" + (r.id === roomId ? " on" : ""), type:"button", onclick: () => switchRoom(r.id)},
       mark(r.shape, r.color, 38),
       h("div", {class:"tx"}, h("div", {class:"nm"}, h("span", {}, r.name), r.vis === "private" ? icon("lock", 13) : null), h("div", {class:"sb"}, sub)),
+      unread[r.id] ? h("span", {class:"badge"}, unread[r.id] > 99 ? "99+" : unread[r.id]) : null);
+  };
+  const dmItem = r => {
+    const partner = dmPartner(r.id);
+    if (!partner) return null; // partner profile not loaded yet — skip this tick, next render will have it
+    const lm = lastMsg(r.id);
+    const sub = lm ? ((lm.uid === (me && me.id) ? "You: " : "") + lm.text) : "Say hello";
+    return h("button", {class:"item" + (r.id === roomId ? " on" : ""), type:"button", onclick: () => switchRoom(r.id)},
+      avatar(partner, 38),
+      h("div", {class:"tx"}, h("div", {class:"nm"}, h("span", {}, partner.name)), h("div", {class:"sb"}, sub)),
       unread[r.id] ? h("span", {class:"badge"}, unread[r.id] > 99 ? "99+" : unread[r.id]) : null);
   };
   const discoverItem = r => h("div", {class:"item"},
@@ -525,6 +588,7 @@ function renderSide(){
       h("button", {class:"pill", type:"button", onclick: codeSheet}, icon("key", 16), "Join with code")),
     h("div", {class:"s-scroll"},
       h("div", {class:"s-sec"}, "Your rooms"), mine.map(roomItem),
+      dms.length ? [h("div", {class:"s-sec"}, "Direct messages"), dms.map(dmItem)] : null,
       discover.length ? [h("div", {class:"s-sec"}, "Discover"), discover.map(discoverItem)] : null,
       h("div", {class:"s-sec"}, "Following"),
       following.length ? following.map(followItem) : h("p", {class:"s-empty"}, "Follow people from their profile and they will show up here.")),
@@ -535,13 +599,21 @@ function renderSide(){
 /* ============ header ============ */
 function renderHeader(){
   const r = cur(); if (!r) return;
-  const n = (presence[r.id] && presence[r.id].size) || 0;
-  $("#roomBtn").replaceChildren(mark(r.shape, r.color, 36),
-    h("div", {class:"tx"}, h("h1", {}, r.name, r.vis === "private" ? icon("lock", 15) : null),
-      h("p", {}, h("span", {class:"live"}), n === 1 ? "Just you" : `${n} members`)));
   const st = $("#people"); st.replaceChildren();
-  [...(presence[r.id] || [])].map(id => users.get(id)).filter(Boolean).slice(0, 3).forEach(u => st.append(avatar(u, 28)));
-  $("#input").placeholder = "Message " + r.name;
+  if (r.vis === "dm"){
+    const partner = dmPartner(r.id);
+    const label = partner ? partner.name : "Direct message";
+    $("#roomBtn").replaceChildren(partner ? avatar(partner, 36) : mark("circle", "#8E98BB", 36),
+      h("div", {class:"tx"}, h("h1", {}, label), h("p", {}, "Just the two of you")));
+    $("#input").placeholder = "Message " + label;
+  } else {
+    const n = (presence[r.id] && presence[r.id].size) || 0;
+    $("#roomBtn").replaceChildren(mark(r.shape, r.color, 36),
+      h("div", {class:"tx"}, h("h1", {}, r.name, r.vis === "private" ? icon("lock", 15) : null),
+        h("p", {}, h("span", {class:"live"}), n === 1 ? "Just you" : `${n} members`)));
+    [...(presence[r.id] || [])].map(id => users.get(id)).filter(Boolean).slice(0, 3).forEach(u => st.append(avatar(u, 28)));
+    $("#input").placeholder = "Message " + r.name;
+  }
   $("#fFol").setAttribute("aria-pressed", filter === "following");
   $("#fAll").setAttribute("aria-pressed", filter === "all");
 }
@@ -559,13 +631,19 @@ function renderChat(newId){
   const room0 = cur();
   if (filter === "all" && room0.rules) list.append(h("div", {class:"pin"}, h("div", {class:"pin-h"}, "📌 Welcome Mat"), h("div", {class:"pin-t"}, room0.rules)));
   let arr = msgs[roomId] || [];
+  if (blocked.size) arr = arr.filter(m => m.system || !blocked.has(m.uid));
   if (filter === "following") arr = arr.filter(m => !m.system && (m.uid === (me && me.id) || follows.has(m.uid)));
   if (!arr.length){
     const r = cur(), e = h("div", {class:"empty"});
     if (filter === "following"){
       e.append(mark("circle", "#66708F", 40), h("h2", {}, "Nothing from people you follow"), h("p", {}, "Tap a name in the room to open a profile and follow them. Their messages will show up here."));
     } else {
-      e.append(mark(r.shape, r.color, 44), h("h2", {}, "The room is quiet"), h("p", {}, r.vis === "private" && r.owner === (me && me.id) ? `Send the first message, then share the code ${r.code} to invite people.` : "Send the first message and say hello."));
+      if (r.vis === "dm"){
+        const partner = dmPartner(r.id);
+        e.append(partner ? avatar(partner, 44) : mark("circle", "#8E98BB", 44), h("h2", {}, partner ? partner.name : "Direct message"), h("p", {}, "Just between you two."));
+      } else {
+        e.append(mark(r.shape, r.color, 44), h("h2", {}, "The room is quiet"), h("p", {}, r.vis === "private" && r.owner === (me && me.id) ? `Send the first message, then share the code ${r.code} to invite people.` : "Send the first message and say hello."));
+      }
     }
     list.append(e); return;
   }
@@ -587,9 +665,9 @@ function renderChat(newId){
       mine ? h("b", {style:"font:700 13.5px var(--display);color:var(--ink)"}, "You") : h("button", {class:"namebtn", type:"button", onclick: () => userSheet(u)}, u.name),
       !mine && follows.has(u.id) ? h("span", {class:"fol"}, "Following") : null,
       h("span", {}, fmtTime(m.ts))));
-    const canRemoveThis = mine || canModerate(roomId);
+    const mod = !mine && canModerate(roomId);
     const b = h("div", {class:"bubble" + (m.status === "sending" ? " pending" : "") + (m.status === "failed" ? " failed" : "")}, m.text);
-    if (canRemoveThis && m.status !== "failed"){
+    if (m.status !== "failed"){
       b.tabIndex = 0; b.setAttribute("role", "button"); b.setAttribute("aria-label", "Press for options.");
       const tg = () => { selectedId = selectedId === m.id ? null : m.id; renderChat(); };
       b.addEventListener("click", tg);
@@ -600,8 +678,12 @@ function renderChat(newId){
       col.append(h("div", {class:"status err"}, "Not sent.",
         h("button", {class:"link", type:"button", onclick: () => retrySend(m)}, "Retry"),
         h("button", {class:"link del", type:"button", onclick: () => { const a = msgs[m.roomId]; a.splice(a.indexOf(m), 1); renderChat(); }}, "Discard")));
-    } else if (canRemoveThis && selectedId === m.id){
-      col.append(h("div", {class:"status"}, h("button", {class:"link del", type:"button", onclick: () => { selectedId = null; chat.remove(m); }}, mine ? "Delete message" : "Remove message")));
+    } else if (selectedId === m.id){
+      const btns = [];
+      if (mine) btns.push(h("button", {class:"link del", type:"button", onclick: () => { selectedId = null; chat.remove(m); }}, "Delete message"));
+      if (!mine) btns.push(h("button", {class:"link", type:"button", onclick: () => { selectedId = null; renderChat(); reportSheet(m, u); }}, "Report"));
+      if (mod) btns.push(h("button", {class:"link del", type:"button", onclick: () => { selectedId = null; chat.remove(m); }}, "Remove message"));
+      col.append(h("div", {class:"status"}, btns));
     }
     row.append(col); list.append(row); prev = m;
   });
@@ -797,16 +879,55 @@ async function userSheet(u){
       tagSlot,
       u.bio ? h("p", {class:"bio"}, u.bio) : h("p", {class:"bio sb", style:"color:var(--muted)"}, "No bio yet."),
       h("div", {class:"stats"}, h("div", {}, count, h("span", {}, "Followers")), h("div", {}, h("b", {}, String(on.length)), h("span", {}, on.length === 1 ? "Shared room" : "Shared rooms"))),
-      followBtn(u, false, () => { count.textContent = String(Math.max(0, (parseInt(count.textContent, 10) || 0) + (follows.has(u.id) ? 1 : -1))); })),
+      h("div", {class:"row2", style:"justify-content:center;margin-top:4px"},
+        followBtn(u, false, () => { count.textContent = String(Math.max(0, (parseInt(count.textContent, 10) || 0) + (follows.has(u.id) ? 1 : -1))); }),
+        h("button", {class:"fbtn", type:"button", onclick: async () => {
+          closeSheet();
+          try{ const r = await chat.getOrCreateDm(u.id); await switchRoom(r.id); }catch{}
+        }}, "Message"))),
     on.length ? h("div", {style:"margin-top:18px"}, h("div", {class:"lg"}, "Shares a room with you"),
       on.map(r => h("button", {class:"item", type:"button", onclick: async () => { if (!joined.has(r.id)) await chat.joinRoom(r.id); closeSheet(); switchRoom(r.id); }},
-        mark(r.shape, r.color, 34), h("div", {class:"tx"}, h("div", {class:"nm"}, r.name), h("div", {class:"sb"}, joined.has(r.id) ? "Go to room" : "Join room"))))) : null));
+        mark(r.shape, r.color, 34), h("div", {class:"tx"}, h("div", {class:"nm"}, r.name), h("div", {class:"sb"}, joined.has(r.id) ? "Go to room" : "Join room"))))) : null,
+    blockSection(u)));
   const [{count:followerCount}, {data:followsMe}] = await Promise.all([
     sb.from("follows").select("*", {count:"exact", head:true}).eq("followee_id", u.id),
     sb.from("follows").select("follower_id").eq("follower_id", u.id).eq("followee_id", me.id).maybeSingle()
   ]);
   count.textContent = String(followerCount ?? 0);
   if (followsMe) tagSlot.replaceChildren(h("span", {class:"tag"}, "Follows you"));
+}
+function reportSheet(m, u){
+  const err = h("p", {class:"err", role:"alert"});
+  const done = h("p", {class:"note"}, "Sent. Thanks for flagging it.");
+  done.hidden = true;
+  const reasons = ["Spam", "Harassment", "Inappropriate content", "Other"];
+  const body = h("div", {});
+  const pickReason = async reason => {
+    [...body.querySelectorAll("button")].forEach(b => b.disabled = true);
+    err.textContent = "";
+    try{ await chat.reportMessage(m.id, reason); done.hidden = false; }
+    catch{ [...body.querySelectorAll("button")].forEach(b => b.disabled = false); err.textContent = "Couldn't send the report. Check your connection and try again."; }
+  };
+  reasons.forEach(r => body.append(h("button", {class:"opt", type:"button", style:"width:100%;text-align:left;cursor:pointer", onclick: () => pickReason(r)}, h("b", {}, r))));
+  openSheet(h("div", {},
+    h("h2", {}, "Report message"),
+    h("p", {class:"sub"}, "From " + u.name + ". Only you and Porch's owner will know you reported this."),
+    body, err, done));
+}
+function blockSection(u){
+  const box = h("div", {style:"margin-top:18px"});
+  const paint = () => {
+    const isBlocked = blocked.has(u.id);
+    box.replaceChildren(
+      h("button", {class:"go ghost", type:"button", style: isBlocked ? "" : "color:var(--danger);border-color:var(--danger)", onclick: async () => {
+        box.firstChild.disabled = true;
+        try{ await chat.block(u.id, !isBlocked); }catch{}
+        paint();
+      }}, isBlocked ? "Unblock" : "Block"),
+      h("p", {class:"note"}, isBlocked ? "You won't see messages from " + u.name + " anywhere on Porch." : "Hides their messages from you everywhere. They won't be notified, and they're not removed from any room.")
+    );
+  };
+  paint(); return box;
 }
 function followBtn(u, small, after){
   const b = h("button", {class:"fbtn" + (small ? " sm" : ""), type:"button"});
@@ -866,7 +987,12 @@ function codeSheet(){
 }
 
 /* --- room details --- */
-$("#roomBtn").onclick = roomSheet; $("#people").onclick = roomSheet;
+function headerTapped(){
+  const r = cur(); if (!r) return;
+  if (r.vis === "dm"){ const partner = dmPartner(r.id); if (partner) userSheet(partner); return; }
+  roomSheet();
+}
+$("#roomBtn").onclick = headerTapped; $("#people").onclick = headerTapped;
 async function roomSheet(){
   const r = cur();
   await loadMembers(r.id); // the member list can change from someone else's session — never trust a stale cache here
@@ -953,11 +1079,14 @@ async function loadSignedInUser(authUser, isFirstTime){
 
   const {data:followRows} = await sb.from("follows").select("followee_id").eq("follower_id", me.id);
   follows = new Set((followRows || []).map(r => r.followee_id));
+  const {data:blockRows} = await sb.from("blocks").select("blocked_id").eq("blocker_id", authId);
+  blocked = new Set((blockRows || []).map(r => r.blocked_id));
   const missing = [...follows].filter(id => !users.has(id));
   if (missing.length){ const {data:fp} = await sb.from("profiles").select("*").in("id", missing); (fp || []).forEach(cacheProfile); }
 
   ready = true;
   resubscribe();
+  subscribeToMyMemberships();
   return isFirstTime || prof.name === "New user";
 }
 async function init(){
