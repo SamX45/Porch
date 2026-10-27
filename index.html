@@ -1270,9 +1270,30 @@ async function connectGoogle(){
   if (error) throw error;
 }
 init();
-if ("serviceWorker" in navigator){
-  navigator.serviceWorker.register("sw.js").catch(() => {}); // installability is a nice-to-have, never block the app on it
-}
+// TEMPORARY DIAGNOSTIC — shows the real service worker result directly on
+// the page, since there's no easy devtools access on mobile. Remove once
+// the install issue is actually found.
+(function(){
+  const box = document.createElement("div");
+  box.style.cssText = "position:fixed;bottom:0;left:0;right:0;z-index:99999;background:#111;color:#0f0;font:12px monospace;padding:10px;white-space:pre-wrap;max-height:40vh;overflow:auto";
+  box.textContent = "SW diagnostic starting…";
+  document.body.appendChild(box);
+  const log = msg => { box.textContent += "\n" + msg; };
+
+  if (!("serviceWorker" in navigator)){
+    log("navigator.serviceWorker is NOT available in this browser at all.");
+    return;
+  }
+  log("navigator.serviceWorker exists. Attempting registration…");
+  navigator.serviceWorker.register("sw.js").then(reg => {
+    log("REGISTER SUCCEEDED. scope=" + reg.scope);
+    log("installing=" + !!reg.installing + " waiting=" + !!reg.waiting + " active=" + !!reg.active);
+    reg.addEventListener("updatefound", () => log("update found, installing new worker…"));
+  }).catch(err => {
+    log("REGISTER FAILED: " + (err && (err.message || err)));
+  });
+  navigator.serviceWorker.getRegistrations().then(regs => log("existing registrations at load: " + regs.length));
+})();
 </script>
 </body>
 </html>
