@@ -6,7 +6,14 @@ const CACHE = "porch-shell-v1";
 const SHELL = ["./", "./index.html", "./manifest.json", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", event => {
-  event.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  // addAll() is all-or-nothing — if even one file 404s, the whole install
+  // silently fails and this service worker never activates. Cache each file
+  // on its own instead, so one bad file can't take down the rest.
+  event.waitUntil(
+    caches.open(CACHE)
+      .then(c => Promise.all(SHELL.map(url => c.add(url).catch(() => {}))))
+      .then(() => self.skipWaiting())
+  );
 });
 
 self.addEventListener("activate", event => {
@@ -28,6 +35,11 @@ self.addEventListener("fetch", event => {
   event.respondWith(
     fetch(event.request)
       .then(res => { caches.open(CACHE).then(c => c.put(event.request, res.clone())); return res; })
-      .catch(() => caches.match(event.request).then(cached => cached || caches.match("./index.html")))
+      .catch(() => caches.match(event.request)
+        .then(cached => cached || caches.match("./index.html"))
+        // last resort: never let respondWith resolve to nothing — an empty
+        // response here can be exactly the kind of failure that crashes a
+        // standalone launch instead of just showing an error page.
+        .then(found => found || new Response("Porch is offline and this page isn't cached yet.", {status: 503, headers:{"Content-Type":"text/plain"}})))
   );
 });
